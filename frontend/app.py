@@ -20,6 +20,9 @@ import streamlit as st
 LAMPORTS_PER_SOL = 1_000_000_000
 VOTE_FEE_LAMPORTS = 5_000
 
+# Monetary columns are stored in lamports and converted to the chosen unit.
+MONETARY_COLS = ["stake", "avgFees", "avgTip", "inflationRewards", "earning"]
+
 # val_stats.csv lives in ../report relative to this file.
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats.csv"
 
@@ -40,6 +43,9 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    if "name" not in df.columns:
+        df["name"] = ""
+    df["name"] = df["name"].fillna("")
     df["client"] = df["client"].fillna("").replace("", "Unknown")
 
     # Earning in lamports.
@@ -49,13 +55,24 @@ def load_data(csv_path: Path) -> pd.DataFrame:
         - df["votes"] * VOTE_FEE_LAMPORTS
     )
 
+    # A human label: validator name when present, otherwise the identity.
+    df["label"] = df.apply(
+        lambda r: r["name"] if str(r["name"]).strip() else r["identity"], axis=1
+    )
+
     return df
 
 
-def to_unit(series: pd.Series, unit: str) -> pd.Series:
-    if unit == "SOL":
-        return series / LAMPORTS_PER_SOL
-    return series
+def numeric_range_filter(df: pd.DataFrame, label: str, col: str, fmt: str) -> pd.Series:
+    """Render a range slider for a numeric column and return a boolean mask."""
+    lo, hi = float(df[col].min()), float(df[col].max())
+    if lo == hi:
+        st.caption(f"{label}: all = {lo:{fmt}}")
+        return pd.Series(True, index=df.index)
+    selected = st.slider(
+        label, min_value=lo, max_value=hi, value=(lo, hi), format=f"%{fmt}"
+    )
+    return df[col].between(selected[0], selected[1])
 
 
 def main() -> None:
@@ -65,12 +82,10 @@ def main() -> None:
         "Earning = (blocks × (avgFees + avgTip) + inflationRewards) − (votes × 5000)"
     )
 
-    # ---- Sidebar controls -------------------------------------------------
+    # ---- Sidebar: data + display -----------------------------------------
     with st.sidebar:
-        st.header("Controls")
-        csv_path_str = st.text_input("CSV path", value=str(DEFAULT_CSV_PATH))
-        csv_path = Path(csv_path_str)
-
+        st.header("Data & display")
+        csv_path = Path(st.text_input("CSV path", value=str(DEFAULT_CSV_PATH)))
         if not csv_path.exists():
             st.error(f"CSV not found at: {csv_path}")
             st.stop()
@@ -82,55 +97,98 @@ def main() -> None:
             "Client aggregation", options=["sum", "mean", "median"], index=0
         )
 
-    df = load_data(csv_path)
+    unit_label = unit
+    raw = load_data(csv_path)
 
-    # ---- Client filter ----------------------------------------------------
-    all_clients = sorted(df["client"].unique())
-    with st.sidebar:
-        selected_clients = st.multiselect(
-            "Clients", options=all_clients, default=all_clients
+    # Convert monetary columns into the chosen unit on a working copy.
+    view = raw.copy()
+    if unit == "SOL":
+        view[MONETARY_COLS] = view[MONETARY_COLS] / LAMPORTS_PER_SOL
+
+    # ---- Top filter: minimum stake ---------------------------------------
+    st.subheader("Filters")
+    fcol1, fcol2 = st.columns([3, 1])
+    stake_max = float(view["stake"].max())
+    with fcol2:
+        quick_1m = st.checkbox("Stake ≥ 1,000,000", value=False, help="Quick preset")
+    with fcol1:
+        default_min = 1_000_000.0 if quick_1m else 0.0
+        min_stake = st.number_input(
+            f"Minimum stake ({unit_label})",
+            min_value=0.0,
+            max_value=stake_max,
+            value=min(default_min, stake_max),
+            step=max(stake_max / 100, 1.0),
+            format="%.2f",
         )
 
-    df = df[df["client"].isin(selected_clients)]
+    # ---- Search bar -------------------------------------------------------
+    query = st.text_input(
+        "Search", placeholder="Search by validator name or identity…"
+    ).strip()
+
+    # ---- Per-column filters ----------------------------------------------
+    mask = pd.Series(True, index=view.index)
+    mask &= view["stake"] >= min_stake
+
+    if query:
+        q = query.lower()
+        mask &= (
+            view["name"].str.lower().str.contains(q, na=False)
+            | view["identity"].str.lower().str.contains(q, na=False)
+        )
+
+    with st.expander("Per-column filters", expanded=False):
+        clients = sorted(view["client"].unique())
+        selected_clients = st.multiselect("client", options=clients, default=clients)
+        mask &= view["client"].isin(selected_clients)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            mask &= numeric_range_filter(view, f"stake ({unit_label})", "stake", ",.2f")
+            mask &= numeric_range_filter(view, "blocks", "blocks", ",.0f")
+            mask &= numeric_range_filter(view, "votes", "votes", ",.0f")
+            mask &= numeric_range_filter(view, "comission (%)", "comission", ",.0f")
+        with c2:
+            mask &= numeric_range_filter(view, f"earning ({unit_label})", "earning", ",.2f")
+            mask &= numeric_range_filter(
+                view, f"inflationRewards ({unit_label})", "inflationRewards", ",.2f"
+            )
+            mask &= numeric_range_filter(view, f"avgFees ({unit_label})", "avgFees", ",.2f")
+            mask &= numeric_range_filter(view, f"avgTip ({unit_label})", "avgTip", ",.2f")
+
+    df = view[mask]
     if df.empty:
-        st.warning("No validators match the current filter.")
+        st.warning("No validators match the current filters.")
         st.stop()
 
-    unit_label = "SOL" if unit == "SOL" else "lamports"
-
     # ---- Summary metrics --------------------------------------------------
-    total_earning = to_unit(df["earning"], unit).sum()
-    avg_earning = to_unit(df["earning"], unit).mean()
-
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Validators", f"{len(df):,}")
     col2.metric("Clients", f"{df['client'].nunique():,}")
-    col3.metric(f"Total earning ({unit_label})", f"{total_earning:,.2f}")
-    col4.metric(f"Avg earning ({unit_label})", f"{avg_earning:,.2f}")
+    col3.metric(f"Total earning ({unit_label})", f"{df['earning'].sum():,.2f}")
+    col4.metric(f"Avg earning ({unit_label})", f"{df['earning'].mean():,.2f}")
 
     # ---- Chart 1: Stake vs Earning ---------------------------------------
     st.subheader("Stake vs. Earning")
-    plot_df = df.copy()
-    plot_df["stake_unit"] = to_unit(plot_df["stake"], unit)
-    plot_df["earning_unit"] = to_unit(plot_df["earning"], unit)
-
     scatter = px.scatter(
-        plot_df,
-        x="stake_unit",
-        y="earning_unit",
+        df,
+        x="stake",
+        y="earning",
         color="client",
-        hover_name="identity",
+        hover_name="label",
         hover_data={
-            "client": True,
+            "name": True,
+            "identity": True,
             "voteAccount": True,
             "blocks": ":,",
             "votes": ":,",
-            "stake_unit": ":,.2f",
-            "earning_unit": ":,.2f",
+            "stake": ":,.2f",
+            "earning": ":,.2f",
         },
         labels={
-            "stake_unit": f"Stake ({unit_label})",
-            "earning_unit": f"Earning ({unit_label})",
+            "stake": f"Stake ({unit_label})",
+            "earning": f"Earning ({unit_label})",
         },
         log_x=log_x,
         log_y=log_y,
@@ -141,14 +199,11 @@ def main() -> None:
 
     # ---- Chart 2: Client vs Earning --------------------------------------
     st.subheader("Client vs. Earning")
-
     grouped = (
-        df.groupby("client")["earning"]
-        .agg(agg)
-        .reset_index()
-        .sort_values("earning", ascending=False)
+        df.groupby("client")["earning"].agg(agg).reset_index().sort_values(
+            "earning", ascending=False
+        )
     )
-    grouped["earning"] = to_unit(grouped["earning"], unit)
     counts = df.groupby("client").size().rename("validators").reset_index()
     grouped = grouped.merge(counts, on="client")
 
@@ -158,35 +213,43 @@ def main() -> None:
         y="earning",
         color="client",
         hover_data={"validators": True, "earning": ":,.2f"},
-        labels={"earning": f"{agg.capitalize()} earning ({unit_label})", "client": "Client"},
+        labels={
+            "earning": f"{agg.capitalize()} earning ({unit_label})",
+            "client": "Client",
+        },
         height=500,
     )
     bar.update_layout(showlegend=False, xaxis={"categoryorder": "total descending"})
     st.plotly_chart(bar, use_container_width=True)
 
     with st.expander("Per-client earning distribution (box plot)"):
-        box_df = df.copy()
-        box_df["earning_unit"] = to_unit(box_df["earning"], unit)
         box = px.box(
-            box_df,
+            df,
             x="client",
-            y="earning_unit",
+            y="earning",
             color="client",
             points="outliers",
-            labels={"earning_unit": f"Earning ({unit_label})", "client": "Client"},
+            labels={"earning": f"Earning ({unit_label})", "client": "Client"},
             height=500,
         )
         box.update_layout(showlegend=False, xaxis={"categoryorder": "median descending"})
         st.plotly_chart(box, use_container_width=True)
 
     # ---- Raw data ---------------------------------------------------------
-    with st.expander("Show data table"):
-        table = df.copy()
-        table["stake"] = to_unit(table["stake"], unit)
-        table["earning"] = to_unit(table["earning"], unit)
+    with st.expander("Show data table", expanded=False):
         st.dataframe(
-            table[
-                ["identity", "client", "stake", "blocks", "votes", "inflationRewards", "earning"]
+            df[
+                [
+                    "name",
+                    "identity",
+                    "client",
+                    "stake",
+                    "blocks",
+                    "votes",
+                    "comission",
+                    "inflationRewards",
+                    "earning",
+                ]
             ].sort_values("earning", ascending=False),
             use_container_width=True,
         )

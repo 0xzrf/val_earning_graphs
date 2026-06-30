@@ -19,6 +19,7 @@ interface ValidatorInfo {
 
 interface ValidatorStats {
     identity: String,
+    name: String,
     voteAccount: String,
     client: String,
     blocks: Number,
@@ -216,17 +217,22 @@ const writeValidatorStats = () => {
         relax_column_count: true,
     }) as Record<string, string>[];
 
-    const identityToClient = new Map<string, string>();
+    const identityToMeta = new Map<string, { name: string; client: string }>();
     for (const record of sourceRecords) {
-        identityToClient.set(record["leader"] ?? "", record["client"] ?? "");
+        identityToMeta.set(record["leader"] ?? "", {
+            name: record["name"] ?? "",
+            client: record["client"] ?? "",
+        });
     }
 
     const stats: ValidatorStats[] = rewardRecords.map((record) => {
         const identity = record["identity"] ?? "";
+        const meta = identityToMeta.get(identity);
         return {
             identity,
+            name: meta?.name ?? "",
             voteAccount: record["voteAccount"] ?? "",
-            client: identityToClient.get(identity) ?? "",
+            client: meta?.client ?? "",
             blocks: Number(record["blocks"] ?? 0),
             avgFees: Number(record["avgFees"] ?? 0),
             avgTip: Number(record["avgTip"] ?? 0),
@@ -239,6 +245,7 @@ const writeValidatorStats = () => {
 
     const columns: (keyof ValidatorStats)[] = [
         "identity",
+        "name",
         "voteAccount",
         "client",
         "blocks",
