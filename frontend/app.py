@@ -1,11 +1,14 @@
-"""Interactive dashboard for Solana validator earnings.
+"""Interactive dashboard for Solana validator earnings (Jito / val_stats2).
 
-Reads ../report/val_stats.csv and visualizes:
+Reads ../report/val_stats2.csv (one row per validator per epoch) and visualizes:
   1. Stake vs. Earning   (scatter)
   2. Client vs. Earning   (aggregated bar + per-client distribution)
 
-Earning is defined as:
-    (blocks * (avgFees + avgTip) + inflationRewards) - (votes * 5000)
+Per-epoch earning:
+    (mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000)
+
+Range earning (epochs Ea..Eb inclusive) is the sum of per-epoch earnings.
+Range stake is the average avg_stake across epochs present in the range.
 
 Run with:
     streamlit run frontend/app.py
@@ -20,11 +23,11 @@ import streamlit as st
 LAMPORTS_PER_SOL = 1_000_000_000
 VOTE_FEE_LAMPORTS = 5_000
 
-# Monetary columns are stored in lamports and converted to the chosen unit.
-MONETARY_COLS = ["stake", "avgFees", "avgTip", "inflationRewards", "earning"]
+MONETARY_COLS = ["stake", "earning", "mev_rewards", "priority_fee_rewards", "inflationRewards"]
 
-# val_stats.csv lives in ../report relative to this file.
-DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats.csv"
+DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats2.csv"
+DEFAULT_EPOCH_START = 981
+DEFAULT_EPOCH_END = 995
 
 
 @st.cache_data
@@ -32,39 +35,80 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
     numeric_cols = [
-        "blocks",
-        "avgFees",
-        "avgTip",
-        "stake",
+        "mev_commission_bps",
+        "mev_rewards",
+        "priority_fee_commission_bps",
+        "priority_fee_rewards",
+        "avg_stake",
+        "epoch",
+        "inflationRewards",
         "comission",
         "votes",
-        "inflationRewards",
     ]
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     if "name" not in df.columns:
         df["name"] = ""
     df["name"] = df["name"].fillna("")
     df["client"] = df["client"].fillna("").replace("", "Unknown")
 
-    # Earning in lamports.
-    df["earning"] = (
-        df["blocks"] * (df["avgFees"] + df["avgTip"])
+    df["epoch_earning"] = (
+        df["mev_rewards"]
+        + df["priority_fee_rewards"]
         + df["inflationRewards"]
         - df["votes"] * VOTE_FEE_LAMPORTS
     )
 
-    # A human label: validator name when present, otherwise the identity.
     df["label"] = df.apply(
-        lambda r: r["name"] if str(r["name"]).strip() else r["identity"], axis=1
+        lambda r: r["name"] if str(r["name"]).strip() else r["identity_account"],
+        axis=1,
     )
 
     return df
 
 
+def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) -> pd.DataFrame:
+    """Collapse per-epoch rows into one row per validator for [epoch_start, epoch_end]."""
+    in_range = df[(df["epoch"] >= epoch_start) & (df["epoch"] <= epoch_end)].copy()
+    if in_range.empty:
+        return in_range
+
+    def first_non_empty(series: pd.Series) -> str:
+        for value in series:
+            if str(value).strip():
+                return str(value)
+        return ""
+
+    grouped = (
+        in_range.groupby("identity_account", as_index=False)
+        .agg(
+            name=("name", first_non_empty),
+            client=("client", first_non_empty),
+            vote_account=("vote_account", "first"),
+            earning=("epoch_earning", "sum"),
+            mev_rewards=("mev_rewards", "sum"),
+            priority_fee_rewards=("priority_fee_rewards", "sum"),
+            inflationRewards=("inflationRewards", "sum"),
+            stake_sum=("avg_stake", "sum"),
+            epochs_in_range=("epoch", "count"),
+            votes=("votes", "max"),
+            comission=("comission", "max"),
+        )
+    )
+
+    # Average stake across epochs this validator appears in within the range.
+    grouped["stake"] = grouped["stake_sum"] / grouped["epochs_in_range"]
+    grouped["label"] = grouped.apply(
+        lambda r: r["name"] if str(r["name"]).strip() else r["identity_account"],
+        axis=1,
+    )
+
+    return grouped.drop(columns=["stake_sum"])
+
+
 def numeric_range_filter(df: pd.DataFrame, label: str, col: str, fmt: str) -> pd.Series:
-    """Render a range slider for a numeric column and return a boolean mask."""
     lo, hi = float(df[col].min()), float(df[col].max())
     if lo == hi:
         st.caption(f"{label}: all = {lo:{fmt}}")
@@ -79,10 +123,10 @@ def main() -> None:
     st.set_page_config(page_title="Validator Earnings", page_icon="📊", layout="wide")
     st.title("Solana Validator Earnings")
     st.caption(
-        "Earning = (blocks × (avgFees + avgTip) + inflationRewards) − (votes × 5000)"
+        "Per-epoch: (mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000). "
+        "Range totals sum earnings; stake is averaged across epochs in range."
     )
 
-    # ---- Sidebar: data + display -----------------------------------------
     with st.sidebar:
         st.header("Data & display")
         csv_path = Path(st.text_input("CSV path", value=str(DEFAULT_CSV_PATH)))
@@ -97,24 +141,57 @@ def main() -> None:
             "Client aggregation", options=["sum", "mean", "median"], index=0
         )
 
-    unit_label = unit
     raw = load_data(csv_path)
+    epoch_min = int(raw["epoch"].min())
+    epoch_max = int(raw["epoch"].max())
 
-    # Convert monetary columns into the chosen unit on a working copy.
-    view = raw.copy()
+    st.subheader("Epoch range")
+    ecol1, ecol2 = st.columns(2)
+    with ecol1:
+        epoch_start = st.number_input(
+            "From epoch (Ea)",
+            min_value=epoch_min,
+            max_value=epoch_max,
+            value=min(DEFAULT_EPOCH_START, epoch_max),
+            step=1,
+        )
+    with ecol2:
+        epoch_end = st.number_input(
+            "To epoch (Eb)",
+            min_value=epoch_min,
+            max_value=epoch_max,
+            value=min(DEFAULT_EPOCH_END, epoch_max),
+            step=1,
+        )
+
+    if epoch_start > epoch_end:
+        st.error("From epoch must be ≤ to epoch.")
+        st.stop()
+
+    aggregated = aggregate_epoch_range(raw, int(epoch_start), int(epoch_end))
+    if aggregated.empty:
+        st.warning(f"No data for epochs {epoch_start}–{epoch_end}.")
+        st.stop()
+
+    st.caption(
+        f"Showing {len(aggregated):,} validators aggregated over epochs "
+        f"{epoch_start}–{epoch_end} ({epoch_end - epoch_start + 1} epochs)."
+    )
+
+    unit_label = unit
+    view = aggregated.copy()
     if unit == "SOL":
         view[MONETARY_COLS] = view[MONETARY_COLS] / LAMPORTS_PER_SOL
 
-    # ---- Top filter: minimum stake ---------------------------------------
     st.subheader("Filters")
     fcol1, fcol2 = st.columns([3, 1])
     stake_max = float(view["stake"].max())
     with fcol2:
-        quick_1m = st.checkbox("Stake ≥ 1,000,000", value=False, help="Quick preset")
+        quick_1m = st.checkbox("Stake ≥ 1,000,000", value=False, help="Quick preset (SOL)")
     with fcol1:
-        default_min = 1_000_000.0 if quick_1m else 0.0
+        default_min = 1_000_000.0 if quick_1m and unit == "SOL" else 0.0
         min_stake = st.number_input(
-            f"Minimum stake ({unit_label})",
+            f"Minimum avg stake ({unit_label})",
             min_value=0.0,
             max_value=stake_max,
             value=min(default_min, stake_max),
@@ -122,12 +199,10 @@ def main() -> None:
             format="%.2f",
         )
 
-    # ---- Search bar -------------------------------------------------------
     query = st.text_input(
         "Search", placeholder="Search by validator name or identity…"
     ).strip()
 
-    # ---- Per-column filters ----------------------------------------------
     mask = pd.Series(True, index=view.index)
     mask &= view["stake"] >= min_stake
 
@@ -135,7 +210,7 @@ def main() -> None:
         q = query.lower()
         mask &= (
             view["name"].str.lower().str.contains(q, na=False)
-            | view["identity"].str.lower().str.contains(q, na=False)
+            | view["identity_account"].str.lower().str.contains(q, na=False)
         )
 
     with st.expander("Per-column filters", expanded=False):
@@ -145,31 +220,31 @@ def main() -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            mask &= numeric_range_filter(view, f"stake ({unit_label})", "stake", ",.2f")
-            mask &= numeric_range_filter(view, "blocks", "blocks", ",.0f")
+            mask &= numeric_range_filter(view, f"avg stake ({unit_label})", "stake", ",.2f")
             mask &= numeric_range_filter(view, "votes", "votes", ",.0f")
             mask &= numeric_range_filter(view, "comission (%)", "comission", ",.0f")
+            mask &= numeric_range_filter(view, "epochs in range", "epochs_in_range", ",.0f")
         with c2:
             mask &= numeric_range_filter(view, f"earning ({unit_label})", "earning", ",.2f")
             mask &= numeric_range_filter(
                 view, f"inflationRewards ({unit_label})", "inflationRewards", ",.2f"
             )
-            mask &= numeric_range_filter(view, f"avgFees ({unit_label})", "avgFees", ",.2f")
-            mask &= numeric_range_filter(view, f"avgTip ({unit_label})", "avgTip", ",.2f")
+            mask &= numeric_range_filter(view, f"mev_rewards ({unit_label})", "mev_rewards", ",.2f")
+            mask &= numeric_range_filter(
+                view, f"priority_fee_rewards ({unit_label})", "priority_fee_rewards", ",.2f"
+            )
 
     df = view[mask]
     if df.empty:
         st.warning("No validators match the current filters.")
         st.stop()
 
-    # ---- Summary metrics --------------------------------------------------
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Validators", f"{len(df):,}")
     col2.metric("Clients", f"{df['client'].nunique():,}")
     col3.metric(f"Total earning ({unit_label})", f"{df['earning'].sum():,.2f}")
     col4.metric(f"Avg earning ({unit_label})", f"{df['earning'].mean():,.2f}")
 
-    # ---- Chart 1: Stake vs Earning ---------------------------------------
     st.subheader("Stake vs. Earning")
     scatter = px.scatter(
         df,
@@ -179,16 +254,16 @@ def main() -> None:
         hover_name="label",
         hover_data={
             "name": True,
-            "identity": True,
-            "voteAccount": True,
-            "blocks": ":,",
+            "identity_account": True,
+            "vote_account": True,
+            "epochs_in_range": True,
             "votes": ":,",
             "stake": ":,.2f",
             "earning": ":,.2f",
         },
         labels={
-            "stake": f"Stake ({unit_label})",
-            "earning": f"Earning ({unit_label})",
+            "stake": f"Avg stake ({unit_label})",
+            "earning": f"Cumulative earning ({unit_label})",
         },
         log_x=log_x,
         log_y=log_y,
@@ -197,12 +272,12 @@ def main() -> None:
     scatter.update_traces(marker=dict(size=8, opacity=0.7))
     st.plotly_chart(scatter, use_container_width=True)
 
-    # ---- Chart 2: Client vs Earning --------------------------------------
     st.subheader("Client vs. Earning")
     grouped = (
-        df.groupby("client")["earning"].agg(agg).reset_index().sort_values(
-            "earning", ascending=False
-        )
+        df.groupby("client")["earning"]
+        .agg(agg)
+        .reset_index()
+        .sort_values("earning", ascending=False)
     )
     counts = df.groupby("client").size().rename("validators").reset_index()
     grouped = grouped.merge(counts, on="client")
@@ -235,19 +310,17 @@ def main() -> None:
         box.update_layout(showlegend=False, xaxis={"categoryorder": "median descending"})
         st.plotly_chart(box, use_container_width=True)
 
-    # ---- Raw data ---------------------------------------------------------
     with st.expander("Show data table", expanded=False):
         st.dataframe(
             df[
                 [
                     "name",
-                    "identity",
+                    "identity_account",
                     "client",
                     "stake",
-                    "blocks",
+                    "epochs_in_range",
                     "votes",
                     "comission",
-                    "inflationRewards",
                     "earning",
                 ]
             ].sort_values("earning", ascending=False),
