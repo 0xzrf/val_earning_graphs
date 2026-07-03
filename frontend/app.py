@@ -15,6 +15,9 @@ Run with:
 """
 
 from pathlib import Path
+import json
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import pandas as pd
 import plotly.express as px
@@ -54,12 +57,10 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     df["name"] = df["name"].fillna("")
     df["client"] = df["client"].fillna("").replace("", "Unknown")
 
-    df["epoch_earning"] = (
-        df["mev_rewards"]
-        + df["priority_fee_rewards"]
-        + df["inflationRewards"]
-        - df["votes"] * VOTE_FEE_LAMPORTS
+    df["epoch_rewards"] = (
+        df["mev_rewards"] + df["priority_fee_rewards"] + df["inflationRewards"]
     )
+    df["vote_cost"] = df["votes"] * VOTE_FEE_LAMPORTS
 
     df["label"] = df.apply(
         lambda r: r["name"] if str(r["name"]).strip() else r["identity_account"],
@@ -67,6 +68,31 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     )
 
     return df
+
+
+def apply_epoch_earning(df: pd.DataFrame, include_vote_costs: bool) -> pd.DataFrame:
+    """Compute per-epoch earning, optionally subtracting vote costs."""
+    out = df.copy()
+    vote_deduction = out["vote_cost"] if include_vote_costs else 0
+    out["epoch_earning"] = out["epoch_rewards"] - vote_deduction
+    return out
+
+
+@st.cache_data(ttl=300)
+def fetch_sol_usd_price() -> float:
+    """Fetch the current SOL/USD price from CoinGecko."""
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+    with urlopen(url, timeout=10) as response:
+        data = json.load(response)
+    return float(data["solana"]["usd"])
+
+
+def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
+    """Add per-epoch earning in SOL and USD for the raw data table."""
+    table = df.copy()
+    table["epoch_earning_sol"] = table["epoch_earning"] / LAMPORTS_PER_SOL
+    table["earning_usd"] = table["epoch_earning_sol"] * sol_usd
+    return table
 
 
 def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) -> pd.DataFrame:
@@ -121,11 +147,6 @@ def numeric_range_filter(df: pd.DataFrame, label: str, col: str, fmt: str) -> pd
 
 def main() -> None:
     st.set_page_config(page_title="Validator Earnings", page_icon="📊", layout="wide")
-    st.title("Solana Validator Earnings")
-    st.caption(
-        "Per-epoch: (mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000). "
-        "Range totals sum earnings; stake is averaged across epochs in range."
-    )
 
     with st.sidebar:
         st.header("Data & display")
@@ -135,6 +156,7 @@ def main() -> None:
             st.stop()
 
         unit = st.radio("Units", options=["SOL", "lamports"], index=0, horizontal=True)
+        include_vote_costs = st.toggle("Include vote costs", value=True)
         log_x = st.checkbox("Log scale: stake (x)", value=True)
         log_y = st.checkbox("Log scale: earning (y)", value=False)
         agg = st.selectbox(
@@ -142,8 +164,29 @@ def main() -> None:
         )
 
     raw = load_data(csv_path)
-    epoch_min = int(raw["epoch"].min())
-    epoch_max = int(raw["epoch"].max())
+    data = apply_epoch_earning(raw, include_vote_costs)
+
+    try:
+        sol_usd = fetch_sol_usd_price()
+    except (URLError, TimeoutError, KeyError, ValueError) as err:
+        st.error(f"Could not fetch SOL/USD price: {err}")
+        st.stop()
+
+    st.sidebar.caption(f"SOL/USD: **${sol_usd:,.2f}**")
+
+    st.title("Solana Validator Earnings")
+    earning_formula = (
+        "(mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000)"
+        if include_vote_costs
+        else "(mev_rewards + priority_fee_rewards + inflationRewards)"
+    )
+    st.caption(
+        f"Per-epoch: {earning_formula}. "
+        "Range totals sum earnings; stake is averaged across epochs in range."
+    )
+
+    epoch_min = int(data["epoch"].min())
+    epoch_max = int(data["epoch"].max())
 
     st.subheader("Epoch range")
     ecol1, ecol2 = st.columns(2)
@@ -168,7 +211,7 @@ def main() -> None:
         st.error("From epoch must be ≤ to epoch.")
         st.stop()
 
-    aggregated = aggregate_epoch_range(raw, int(epoch_start), int(epoch_end))
+    aggregated = aggregate_epoch_range(data, int(epoch_start), int(epoch_end))
     if aggregated.empty:
         st.warning(f"No data for epochs {epoch_start}–{epoch_end}.")
         st.stop()
@@ -311,8 +354,13 @@ def main() -> None:
         st.plotly_chart(box, use_container_width=True)
 
     with st.expander("Show data table", expanded=False):
-        st.caption(f"All {len(raw):,} rows from {csv_path.name}")
-        st.dataframe(raw, use_container_width=True)
+        table_data = prepare_table_data(data, sol_usd)
+        vote_note = "vote costs included" if include_vote_costs else "vote costs excluded"
+        st.caption(
+            f"All {len(table_data):,} rows from {csv_path.name} · "
+            f"epoch_earning_sol in SOL · earning_usd at ${sol_usd:,.2f}/SOL · {vote_note}"
+        )
+        st.dataframe(table_data, use_container_width=True)
 
 
 if __name__ == "__main__":
