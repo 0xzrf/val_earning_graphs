@@ -311,21 +311,8 @@ def main() -> None:
         st.plotly_chart(box, use_container_width=True)
 
     with st.expander("Show data table", expanded=False):
-        st.dataframe(
-            df[
-                [
-                    "name",
-                    "identity_account",
-                    "client",
-                    "stake",
-                    "epochs_in_range",
-                    "votes",
-                    "comission",
-                    "earning",
-                ]
-            ].sort_values("earning", ascending=False),
-            use_container_width=True,
-        )
+        st.caption(f"All {len(raw):,} rows from {csv_path.name}")
+        st.dataframe(raw, use_container_width=True)
 
 
 if __name__ == "__main__":
