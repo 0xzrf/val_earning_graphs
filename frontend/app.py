@@ -5,17 +5,21 @@ Reads ../report/val_stats2.csv (one row per validator per epoch) and visualizes:
   2. Client vs. Earning   (aggregated bar + per-client distribution)
 
 Per-epoch earning:
-    (mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000)
+    (mev_rewards + priority_fee_rewards + inflationRewards)
 
-Range earning (epochs Ea..Eb inclusive) is the sum of per-epoch earnings.
-Range stake is the average avg_stake across epochs present in the range.
+All values are shown in SOL.
+
+The date range (2026-06-03 .. 2026-07-02) maps onto epochs 981..995
+(~2 days per epoch). Partially covered epochs are excluded from the range.
 
 Run with:
     streamlit run frontend/app.py
 """
 
-from pathlib import Path
 import json
+import math
+from datetime import date
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -24,13 +28,18 @@ import plotly.express as px
 import streamlit as st
 
 LAMPORTS_PER_SOL = 1_000_000_000
-VOTE_FEE_LAMPORTS = 5_000
 
 MONETARY_COLS = ["stake", "earning", "mev_rewards", "priority_fee_rewards", "inflationRewards"]
 
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats2.csv"
-DEFAULT_EPOCH_START = 981
-DEFAULT_EPOCH_END = 995
+
+# Date <-> epoch mapping: DATE_START is the first day of EPOCH_AT_DATE_START,
+# and each epoch spans ~2 days.
+DATE_START = date(2026, 6, 3)
+DATE_END = date(2026, 7, 2)
+EPOCH_AT_DATE_START = 981
+EPOCH_AT_DATE_END = 995
+DAYS_PER_EPOCH = 2
 
 
 @st.cache_data
@@ -57,10 +66,9 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     df["name"] = df["name"].fillna("")
     df["client"] = df["client"].fillna("").replace("", "Unknown")
 
-    df["epoch_rewards"] = (
+    df["epoch_earning"] = (
         df["mev_rewards"] + df["priority_fee_rewards"] + df["inflationRewards"]
     )
-    df["vote_cost"] = df["votes"] * VOTE_FEE_LAMPORTS
 
     df["label"] = df.apply(
         lambda r: r["name"] if str(r["name"]).strip() else r["identity_account"],
@@ -68,14 +76,6 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     )
 
     return df
-
-
-def apply_epoch_earning(df: pd.DataFrame, include_vote_costs: bool) -> pd.DataFrame:
-    """Compute per-epoch earning, optionally subtracting vote costs."""
-    out = df.copy()
-    vote_deduction = out["vote_cost"] if include_vote_costs else 0
-    out["epoch_earning"] = out["epoch_rewards"] - vote_deduction
-    return out
 
 
 @st.cache_data(ttl=300)
@@ -87,12 +87,19 @@ def fetch_sol_usd_price() -> float:
     return float(data["solana"]["usd"])
 
 
-def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
-    """Add per-epoch earning in SOL and USD for the raw data table."""
-    table = df.copy()
-    table["epoch_earning_sol"] = table["epoch_earning"] / LAMPORTS_PER_SOL
-    table["earning_usd"] = table["epoch_earning_sol"] * sol_usd
-    return table.drop(columns=["epoch_earning"])
+def date_range_to_epochs(from_date: date, to_date: date) -> tuple[int, int]:
+    """Map a date range onto the epoch range, dropping partially covered epochs.
+
+    The full range (DATE_START..DATE_END) maps to 981..995. Moving the start
+    date forward excludes the head epoch as soon as it is only partially
+    covered; the end date works the same way in reverse.
+    """
+    start_offset_days = (from_date - DATE_START).days
+    end_offset_days = (DATE_END - to_date).days
+
+    epoch_start = EPOCH_AT_DATE_START + math.ceil(start_offset_days / DAYS_PER_EPOCH)
+    epoch_end = EPOCH_AT_DATE_END - math.ceil(end_offset_days / DAYS_PER_EPOCH)
+    return epoch_start, epoch_end
 
 
 def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) -> pd.DataFrame:
@@ -134,6 +141,46 @@ def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) ->
     return grouped.drop(columns=["stake_sum"])
 
 
+def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
+    """One row per validator: accumulated earning across all available epochs, in SOL."""
+    epoch_min = int(df["epoch"].min())
+    epoch_max = int(df["epoch"].max())
+    accumulated = aggregate_epoch_range(df, epoch_min, epoch_max)
+
+    table = accumulated.copy()
+    for col in ["earning", "mev_rewards", "priority_fee_rewards", "inflationRewards", "stake"]:
+        table[col] = table[col] / LAMPORTS_PER_SOL
+
+    table["earning_usd"] = table["earning"] * sol_usd
+
+    table = table.rename(
+        columns={
+            "earning": "accumulated_earning_sol",
+            "stake": "avg_stake_sol",
+            "mev_rewards": "mev_rewards_sol",
+            "priority_fee_rewards": "priority_fee_rewards_sol",
+            "inflationRewards": "inflation_rewards_sol",
+            "epochs_in_range": "epochs",
+        }
+    )
+
+    columns = [
+        "name",
+        "client",
+        "identity_account",
+        "vote_account",
+        "avg_stake_sol",
+        "epochs",
+        "comission",
+        "mev_rewards_sol",
+        "priority_fee_rewards_sol",
+        "inflation_rewards_sol",
+        "accumulated_earning_sol",
+        "earning_usd",
+    ]
+    return table[columns].sort_values("accumulated_earning_sol", ascending=False)
+
+
 def numeric_range_filter(df: pd.DataFrame, label: str, col: str, fmt: str) -> pd.Series:
     lo, hi = float(df[col].min()), float(df[col].max())
     if lo == hi:
@@ -155,8 +202,6 @@ def main() -> None:
             st.error(f"CSV not found at: {csv_path}")
             st.stop()
 
-        unit = st.radio("Units", options=["SOL", "lamports"], index=0, horizontal=True)
-        include_vote_costs = st.toggle("Include vote costs", value=True)
         log_x = st.checkbox("Log scale: stake (x)", value=True)
         log_y = st.checkbox("Log scale: earning (y)", value=False)
         agg = st.selectbox(
@@ -164,7 +209,6 @@ def main() -> None:
         )
 
     raw = load_data(csv_path)
-    data = apply_epoch_earning(raw, include_vote_costs)
 
     try:
         sol_usd = fetch_sol_usd_price()
@@ -175,56 +219,74 @@ def main() -> None:
     st.sidebar.caption(f"SOL/USD: **${sol_usd:,.2f}**")
 
     st.title("Solana Validator Earnings")
-    earning_formula = (
-        "(mev_rewards + priority_fee_rewards + inflationRewards) − (votes × 5000)"
-        if include_vote_costs
-        else "(mev_rewards + priority_fee_rewards + inflationRewards)"
-    )
     st.caption(
-        f"Per-epoch: {earning_formula}. "
-        "Range totals sum earnings; stake is averaged across epochs in range."
+        "Per-epoch: (mev_rewards + priority_fee_rewards + inflationRewards). "
+        "Range totals sum earnings; stake is averaged across epochs in range. "
+        "All values in SOL."
     )
 
-    epoch_min = int(data["epoch"].min())
-    epoch_max = int(data["epoch"].max())
+    epoch_min = int(raw["epoch"].min())
+    epoch_max = int(raw["epoch"].max())
 
-    st.subheader("Epoch range")
-    ecol1, ecol2 = st.columns(2)
-    with ecol1:
-        epoch_start = st.number_input(
-            "From epoch (Ea)",
-            min_value=epoch_min,
-            max_value=epoch_max,
-            value=min(DEFAULT_EPOCH_START, epoch_max),
-            step=1,
-        )
-    with ecol2:
-        epoch_end = st.number_input(
-            "To epoch (Eb)",
-            min_value=epoch_min,
-            max_value=epoch_max,
-            value=min(DEFAULT_EPOCH_END, epoch_max),
-            step=1,
+    # ---- Date range -> epoch range ----------------------------------------
+    st.subheader("Date range")
+    dcol1, dcol2 = st.columns([2, 1])
+    with dcol1:
+        selected_dates = st.date_input(
+            "Period",
+            value=(DATE_START, DATE_END),
+            min_value=DATE_START,
+            max_value=DATE_END,
+            help=f"{DATE_START} .. {DATE_END} maps to epochs "
+            f"{EPOCH_AT_DATE_START}–{EPOCH_AT_DATE_END} (~{DAYS_PER_EPOCH} days per epoch). "
+            "Partially covered epochs are excluded.",
         )
 
-    if epoch_start > epoch_end:
-        st.error("From epoch must be ≤ to epoch.")
+    if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+        from_date, to_date = selected_dates
+    else:
+        st.info("Select both start and end dates.")
         st.stop()
 
-    aggregated = aggregate_epoch_range(data, int(epoch_start), int(epoch_end))
+    if from_date > to_date:
+        st.error("Start date must be ≤ end date.")
+        st.stop()
+
+    epoch_start, epoch_end = date_range_to_epochs(from_date, to_date)
+    epoch_start = max(epoch_start, epoch_min)
+    epoch_end = min(epoch_end, epoch_max)
+
+    if epoch_start > epoch_end:
+        st.error("The selected date range does not fully cover any epoch.")
+        st.stop()
+
+    with dcol2:
+        st.metric("Epoch range", f"{epoch_start} – {epoch_end}")
+
+    # ---- Client dropdown ---------------------------------------------------
+    all_clients = sorted(raw["client"].unique())
+    selected_client = st.selectbox("Client", options=["All clients"] + all_clients)
+
+    aggregated = aggregate_epoch_range(raw, epoch_start, epoch_end)
     if aggregated.empty:
         st.warning(f"No data for epochs {epoch_start}–{epoch_end}.")
         st.stop()
 
+    if selected_client != "All clients":
+        aggregated = aggregated[aggregated["client"] == selected_client]
+        if aggregated.empty:
+            st.warning(f"No validators for client {selected_client} in this range.")
+            st.stop()
+
     st.caption(
         f"Showing {len(aggregated):,} validators aggregated over epochs "
-        f"{epoch_start}–{epoch_end} ({epoch_end - epoch_start + 1} epochs)."
+        f"{epoch_start}–{epoch_end} ({epoch_end - epoch_start + 1} epochs)"
+        + ("" if selected_client == "All clients" else f" · client: {selected_client}")
     )
 
-    unit_label = unit
+    # Everything below is in SOL.
     view = aggregated.copy()
-    if unit == "SOL":
-        view[MONETARY_COLS] = view[MONETARY_COLS] / LAMPORTS_PER_SOL
+    view[MONETARY_COLS] = view[MONETARY_COLS] / LAMPORTS_PER_SOL
 
     st.subheader("Filters")
     fcol1, fcol2 = st.columns([3, 1])
@@ -232,9 +294,9 @@ def main() -> None:
     with fcol2:
         quick_1m = st.checkbox("Stake ≥ 1,000,000", value=False, help="Quick preset (SOL)")
     with fcol1:
-        default_min = 1_000_000.0 if quick_1m and unit == "SOL" else 0.0
+        default_min = 1_000_000.0 if quick_1m else 0.0
         min_stake = st.number_input(
-            f"Minimum avg stake ({unit_label})",
+            "Minimum avg stake (SOL)",
             min_value=0.0,
             max_value=stake_max,
             value=min(default_min, stake_max),
@@ -257,24 +319,18 @@ def main() -> None:
         )
 
     with st.expander("Per-column filters", expanded=False):
-        clients = sorted(view["client"].unique())
-        selected_clients = st.multiselect("client", options=clients, default=clients)
-        mask &= view["client"].isin(selected_clients)
-
         c1, c2 = st.columns(2)
         with c1:
-            mask &= numeric_range_filter(view, f"avg stake ({unit_label})", "stake", ",.2f")
+            mask &= numeric_range_filter(view, "avg stake (SOL)", "stake", ",.2f")
             mask &= numeric_range_filter(view, "votes", "votes", ",.0f")
             mask &= numeric_range_filter(view, "comission (%)", "comission", ",.0f")
             mask &= numeric_range_filter(view, "epochs in range", "epochs_in_range", ",.0f")
         with c2:
-            mask &= numeric_range_filter(view, f"earning ({unit_label})", "earning", ",.2f")
+            mask &= numeric_range_filter(view, "earning (SOL)", "earning", ",.2f")
+            mask &= numeric_range_filter(view, "inflationRewards (SOL)", "inflationRewards", ",.2f")
+            mask &= numeric_range_filter(view, "mev_rewards (SOL)", "mev_rewards", ",.2f")
             mask &= numeric_range_filter(
-                view, f"inflationRewards ({unit_label})", "inflationRewards", ",.2f"
-            )
-            mask &= numeric_range_filter(view, f"mev_rewards ({unit_label})", "mev_rewards", ",.2f")
-            mask &= numeric_range_filter(
-                view, f"priority_fee_rewards ({unit_label})", "priority_fee_rewards", ",.2f"
+                view, "priority_fee_rewards (SOL)", "priority_fee_rewards", ",.2f"
             )
 
     df = view[mask]
@@ -285,8 +341,8 @@ def main() -> None:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Validators", f"{len(df):,}")
     col2.metric("Clients", f"{df['client'].nunique():,}")
-    col3.metric(f"Total earning ({unit_label})", f"{df['earning'].sum():,.2f}")
-    col4.metric(f"Avg earning ({unit_label})", f"{df['earning'].mean():,.2f}")
+    col3.metric("Total earning (SOL)", f"{df['earning'].sum():,.2f}")
+    col4.metric("Avg earning (SOL)", f"{df['earning'].mean():,.2f}")
 
     st.subheader("Stake vs. Earning")
     scatter = px.scatter(
@@ -305,8 +361,8 @@ def main() -> None:
             "earning": ":,.2f",
         },
         labels={
-            "stake": f"Avg stake ({unit_label})",
-            "earning": f"Cumulative earning ({unit_label})",
+            "stake": "Avg stake (SOL)",
+            "earning": "Cumulative earning (SOL)",
         },
         log_x=log_x,
         log_y=log_y,
@@ -332,7 +388,7 @@ def main() -> None:
         color="client",
         hover_data={"validators": True, "earning": ":,.2f"},
         labels={
-            "earning": f"{agg.capitalize()} earning ({unit_label})",
+            "earning": f"{agg.capitalize()} earning (SOL)",
             "client": "Client",
         },
         height=500,
@@ -347,18 +403,19 @@ def main() -> None:
             y="earning",
             color="client",
             points="outliers",
-            labels={"earning": f"Earning ({unit_label})", "client": "Client"},
+            labels={"earning": "Earning (SOL)", "client": "Client"},
             height=500,
         )
         box.update_layout(showlegend=False, xaxis={"categoryorder": "median descending"})
         st.plotly_chart(box, use_container_width=True)
 
     with st.expander("Show data table", expanded=False):
-        table_data = prepare_table_data(data, sol_usd)
-        vote_note = "vote costs included" if include_vote_costs else "vote costs excluded"
+        table_data = prepare_table_data(raw, sol_usd)
+        if selected_client != "All clients":
+            table_data = table_data[table_data["client"] == selected_client]
         st.caption(
-            f"All {len(table_data):,} rows from {csv_path.name} · "
-            f"epoch_earning_sol in SOL · earning_usd at ${sol_usd:,.2f}/SOL · {vote_note}"
+            f"{len(table_data):,} validators · accumulated earning over epochs "
+            f"{epoch_min}–{epoch_max} · values in SOL · earning_usd at ${sol_usd:,.2f}/SOL"
         )
         st.dataframe(table_data, use_container_width=True)
 
