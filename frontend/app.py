@@ -1,11 +1,10 @@
 """Interactive dashboard for Solana validator earnings (Jito / val_stats2).
 
-Reads ../report/val_stats2.csv (one row per validator per epoch) and visualizes:
-  1. Stake vs. Earning   (scatter)
-  2. Client vs. Earning   (aggregated bar + per-client distribution)
+Reads ../report/val_stats2.csv (one row per validator per epoch) and shows
+summary metrics plus a per-validator accumulated earnings table.
 
 Per-epoch earning:
-    (mev_rewards + priority_fee_rewards + inflationRewards)
+    (mev_rewards + priority_fee_rewards + inflationRewards - vote_fees)
 
 All values are shown in SOL.
 
@@ -24,12 +23,18 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 LAMPORTS_PER_SOL = 1_000_000_000
 
-MONETARY_COLS = ["stake", "earning", "mev_rewards", "priority_fee_rewards", "inflationRewards"]
+MONETARY_COLS = [
+    "stake",
+    "earning",
+    "mev_rewards",
+    "priority_fee_rewards",
+    "inflationRewards",
+    "vote_fees",
+]
 
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats2.csv"
 
@@ -55,7 +60,7 @@ def load_data(csv_path: Path) -> pd.DataFrame:
         "epoch",
         "inflationRewards",
         "comission",
-        "votes",
+        "vote_fees",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -65,9 +70,14 @@ def load_data(csv_path: Path) -> pd.DataFrame:
         df["name"] = ""
     df["name"] = df["name"].fillna("")
     df["client"] = df["client"].fillna("").replace("", "Unknown")
+    if "vote_fees" not in df.columns:
+        df["vote_fees"] = 0
 
     df["epoch_earning"] = (
-        df["mev_rewards"] + df["priority_fee_rewards"] + df["inflationRewards"]
+        df["mev_rewards"]
+        + df["priority_fee_rewards"]
+        + df["inflationRewards"]
+        - df["vote_fees"]
     )
 
     df["label"] = df.apply(
@@ -124,9 +134,9 @@ def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) ->
             mev_rewards=("mev_rewards", "sum"),
             priority_fee_rewards=("priority_fee_rewards", "sum"),
             inflationRewards=("inflationRewards", "sum"),
+            vote_fees=("vote_fees", "sum"),
             stake_sum=("avg_stake", "sum"),
             epochs_in_range=("epoch", "count"),
-            votes=("votes", "max"),
             comission=("comission", "max"),
         )
     )
@@ -148,7 +158,14 @@ def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
     accumulated = aggregate_epoch_range(df, epoch_min, epoch_max)
 
     table = accumulated.copy()
-    for col in ["earning", "mev_rewards", "priority_fee_rewards", "inflationRewards", "stake"]:
+    for col in [
+        "earning",
+        "mev_rewards",
+        "priority_fee_rewards",
+        "inflationRewards",
+        "vote_fees",
+        "stake",
+    ]:
         table[col] = table[col] / LAMPORTS_PER_SOL
 
     table["earning_usd"] = table["earning"] * sol_usd
@@ -160,6 +177,7 @@ def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
             "mev_rewards": "mev_rewards_sol",
             "priority_fee_rewards": "priority_fee_rewards_sol",
             "inflationRewards": "inflation_rewards_sol",
+            "vote_fees": "vote_fees_sol",
             "epochs_in_range": "epochs",
         }
     )
@@ -168,13 +186,13 @@ def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
         "name",
         "client",
         "identity_account",
-        "vote_account",
         "avg_stake_sol",
         "epochs",
         "comission",
         "mev_rewards_sol",
         "priority_fee_rewards_sol",
         "inflation_rewards_sol",
+        "vote_fees_sol",
         "accumulated_earning_sol",
         "earning_usd",
     ]
@@ -202,12 +220,6 @@ def main() -> None:
             st.error(f"CSV not found at: {csv_path}")
             st.stop()
 
-        log_x = st.checkbox("Log scale: stake (x)", value=True)
-        log_y = st.checkbox("Log scale: earning (y)", value=False)
-        agg = st.selectbox(
-            "Client aggregation", options=["sum", "mean", "median"], index=0
-        )
-
     raw = load_data(csv_path)
 
     try:
@@ -220,7 +232,7 @@ def main() -> None:
 
     st.title("Solana Validator Earnings")
     st.caption(
-        "Per-epoch: (mev_rewards + priority_fee_rewards + inflationRewards). "
+        "Per-epoch: (mev_rewards + priority_fee_rewards + inflationRewards - vote_fees). "
         "Range totals sum earnings; stake is averaged across epochs in range. "
         "All values in SOL."
     )
@@ -322,7 +334,7 @@ def main() -> None:
         c1, c2 = st.columns(2)
         with c1:
             mask &= numeric_range_filter(view, "avg stake (SOL)", "stake", ",.2f")
-            mask &= numeric_range_filter(view, "votes", "votes", ",.0f")
+            mask &= numeric_range_filter(view, "vote fees (SOL)", "vote_fees", ",.2f")
             mask &= numeric_range_filter(view, "comission (%)", "comission", ",.0f")
             mask &= numeric_range_filter(view, "epochs in range", "epochs_in_range", ",.0f")
         with c2:
@@ -343,71 +355,6 @@ def main() -> None:
     col2.metric("Clients", f"{df['client'].nunique():,}")
     col3.metric("Total earning (SOL)", f"{df['earning'].sum():,.2f}")
     col4.metric("Avg earning (SOL)", f"{df['earning'].mean():,.2f}")
-
-    st.subheader("Stake vs. Earning")
-    scatter = px.scatter(
-        df,
-        x="stake",
-        y="earning",
-        color="client",
-        hover_name="label",
-        hover_data={
-            "name": True,
-            "identity_account": True,
-            "vote_account": True,
-            "epochs_in_range": True,
-            "votes": ":,",
-            "stake": ":,.2f",
-            "earning": ":,.2f",
-        },
-        labels={
-            "stake": "Avg stake (SOL)",
-            "earning": "Cumulative earning (SOL)",
-        },
-        log_x=log_x,
-        log_y=log_y,
-        height=600,
-    )
-    scatter.update_traces(marker=dict(size=8, opacity=0.7))
-    st.plotly_chart(scatter, use_container_width=True)
-
-    st.subheader("Client vs. Earning")
-    grouped = (
-        df.groupby("client")["earning"]
-        .agg(agg)
-        .reset_index()
-        .sort_values("earning", ascending=False)
-    )
-    counts = df.groupby("client").size().rename("validators").reset_index()
-    grouped = grouped.merge(counts, on="client")
-
-    bar = px.bar(
-        grouped,
-        x="client",
-        y="earning",
-        color="client",
-        hover_data={"validators": True, "earning": ":,.2f"},
-        labels={
-            "earning": f"{agg.capitalize()} earning (SOL)",
-            "client": "Client",
-        },
-        height=500,
-    )
-    bar.update_layout(showlegend=False, xaxis={"categoryorder": "total descending"})
-    st.plotly_chart(bar, use_container_width=True)
-
-    with st.expander("Per-client earning distribution (box plot)"):
-        box = px.box(
-            df,
-            x="client",
-            y="earning",
-            color="client",
-            points="outliers",
-            labels={"earning": "Earning (SOL)", "client": "Client"},
-            height=500,
-        )
-        box.update_layout(showlegend=False, xaxis={"categoryorder": "median descending"})
-        st.plotly_chart(box, use_container_width=True)
 
     with st.expander("Show data table", expanded=False):
         table_data = prepare_table_data(raw, sol_usd)

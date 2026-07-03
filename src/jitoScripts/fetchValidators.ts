@@ -62,16 +62,6 @@ interface JitoValidatorsResponse {
     validators: JitoValidator[];
 }
 
-// Lamport fields from the API can exceed Number.MAX_SAFE_INTEGER. JSON.parse
-// turns them into imprecise floats, which makes `new BN(number)` throw.
-const parseValidatorsResponse = (text: string): JitoValidatorsResponse => {
-    const normalized = text
-        .replace(/"active_stake":(\d+)/g, '"active_stake":"$1"')
-        .replace(/"jito_directed_stake_lamports":(\d+)/g, '"jito_directed_stake_lamports":"$1"');
-
-    return JSON.parse(normalized) as JitoValidatorsResponse;
-};
-
 const toStakeBn = (activeStake: string): BN => new BN(activeStake);
 
 /**
@@ -128,6 +118,8 @@ const fetchInflationRewardsForEpoch = async (targetEpoch: number) => {
 const fetchValidatorsForEpoch = async (
     targetEpoch: number,
 ): Promise<{ validators: JitoValidator[] }> => {
+    console.log("targetEpoch", targetEpoch)
+
     const response = await fetch(`${JITO_API_BASE}/validators`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -139,11 +131,14 @@ const fetchValidatorsForEpoch = async (
         throw new Error(`Jito API ${response.status} ${response.statusText}: ${body}`);
     }
 
-    const data = parseValidatorsResponse(await response.text());
+    const val = await response.json() as JitoValidatorsResponse
 
-    console.log("data", data)
+    console.log(val.validators[0])
+
+    // const data = parseValidatorsResponse(await response.text());
+
     return {
-        validators: data.validators,
+        validators: val.validators,
     };
 };
 
@@ -181,112 +176,146 @@ const fetchCurrentEpoch = async (): Promise<number> => {
     return epochInfo.epoch;
 };
 
-const enrichValidatorNamesFromValStats = () => {
-    const valStats2Records = parse(readFileSync(VAL_STATS2_CSV_PATH, "utf-8"), {
-        columns: true,
-        skip_empty_lines: true,
-        bom: true,
-    }) as Record<string, string>[];
+/** Per-epoch performance figures cached from the Solana Compass API. */
+interface ApiCache {
+    epoch: number;
+    vote_fees: number;
+    priority_fees: number;
+    jito_total: number;
+}
 
-    const valStatsRecords = parse(readFileSync(VAL_STATS_CSV_PATH, "utf-8"), {
-        columns: true,
-        skip_empty_lines: true,
-        bom: true,
-    }) as Record<string, string>[];
+/** One row of val_stats2.csv (the `votes` column is dropped on read). */
+interface ValStatsRow extends ValidatorInfo {
+    comission: number;
+    vote_fees: number;
+}
 
-    const identityToCommissionVotes = new Map<string, { comission: string; votes: string }>();
-    for (const record of valStatsRecords) {
-        identityToCommissionVotes.set(record["identity"] ?? "", {
-            comission: record["comission"] ?? "",
-            votes: record["votes"] ?? "",
-        });
+interface EpochPerformanceEntry {
+    epoch: number;
+    leader: string;
+    vote_fees: number;
+    priority_fees: number;
+    jito_total: number;
+}
+
+interface EpochPerformanceResponse {
+    data: EpochPerformanceEntry[];
+}
+
+const SOLANA_COMPASS_API_BASE = "https://solanacompass.com/api/epoch-performance/validator";
+const EPOCH_PERFORMANCE_LIMIT = 14;
+
+/** GET /api/epoch-performance/validator/{identity}?limit=14&offset=0 */
+const fetchEpochPerformance = async (identity: string): Promise<EpochPerformanceEntry[]> => {
+    const url = `${SOLANA_COMPASS_API_BASE}/${identity}?limit=${EPOCH_PERFORMANCE_LIMIT}&offset=0`;
+
+    const response = await fetch(url, { headers: { accept: "application/json" } });
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Solana Compass API ${response.status} ${response.statusText}: ${body}`);
     }
 
-    const enriched = valStats2Records.map((record) => {
-        const meta = identityToCommissionVotes.get(record["identity_account"] ?? "");
-        return {
-            ...record,
-            comission: meta?.comission ?? "",
-            votes: meta?.votes ?? "",
-        };
-    });
-
-    const columns = [
-        "name",
-        "client",
-        "identity_account",
-        "vote_account",
-        "mev_commission_bps",
-        "mev_rewards",
-        "priority_fee_commission_bps",
-        "priority_fee_rewards",
-        "avg_stake",
-        "epoch",
-        "inflationRewards",
-        "comission",
-        "votes",
-    ];
-
-    const output = stringify(enriched, { header: true, columns });
-    writeFileSync(VAL_STATS2_CSV_PATH, output, "utf-8");
-    console.log(`Wrote ${enriched.length} rows to ${VAL_STATS2_CSV_PATH}`);
+    const json = await response.json() as EpochPerformanceResponse;
+    return json.data ?? [];
 };
 
-const writeValInfoToCsv = () => {
-    const columns: (keyof ValidatorInfo)[] = [
-        "name",
-        "client",
-        "identity_account",
-        "vote_account",
-        "mev_commission_bps",
-        "mev_rewards",
-        "priority_fee_commission_bps",
-        "priority_fee_rewards",
-        "avg_stake",
-        "epoch",
-        "inflationRewards",
-    ];
+const readValStats2 = (): ValStatsRow[] => {
+    const raw = readFileSync(VAL_STATS2_CSV_PATH, "utf8");
+    const records = parse(raw, { columns: true, skip_empty_lines: true }) as Record<string, string>[];
 
-    const rows = valInfo.map((validator) => ({
-        ...validator,
-        avg_stake: validator.avg_stake.toString(),
+    return records.map((record) => ({
+        name: record.name ?? "",
+        client: record.client ?? "",
+        identity_account: record.identity_account!,
+        vote_account: record.vote_account!,
+        mev_commission_bps: Number(record.mev_commission_bps),
+        mev_rewards: Number(record.mev_rewards),
+        priority_fee_commission_bps: Number(record.priority_fee_commission_bps),
+        priority_fee_rewards: Number(record.priority_fee_rewards),
+        avg_stake: toStakeBn(record.avg_stake!),
+        epoch: Number(record.epoch),
+        inflationRewards: Number(record.inflationRewards),
+        comission: Number(record.comission),
+        vote_fees: 0,
+    }));
+};
+
+const writeValStats2 = (rows: ValStatsRow[]) => {
+    const output = rows.map((row) => ({
+        name: row.name,
+        client: row.client,
+        identity_account: row.identity_account,
+        vote_account: row.vote_account,
+        mev_commission_bps: row.mev_commission_bps,
+        mev_rewards: row.mev_rewards,
+        priority_fee_commission_bps: row.priority_fee_commission_bps,
+        priority_fee_rewards: row.priority_fee_rewards,
+        avg_stake: row.avg_stake.toString(),
+        epoch: row.epoch,
+        inflationRewards: row.inflationRewards,
+        comission: row.comission,
+        vote_fees: row.vote_fees,
     }));
 
-    const output = stringify(rows, { header: true, columns });
-    writeFileSync(VAL_STATS2_CSV_PATH, output, "utf-8");
-    console.log(`Wrote ${valInfo.length} validators to ${VAL_STATS2_CSV_PATH}`);
+    writeFileSync(VAL_STATS2_CSV_PATH, stringify(output, { header: true }));
+    console.log(`Wrote ${output.length} rows to ${VAL_STATS2_CSV_PATH}`);
 };
 
 export const getValidatorInfo = async () => {
-    // valInfo = [];
+    const rows = readValStats2();
+    console.log(`Loaded ${rows.length} rows from val_stats2.csv`);
 
-    // const epoch = await fetchCurrentEpoch();
+    // One entry per validator pubkey; each API call covers all recent epochs,
+    // so a validator already in the map never triggers another call.
+    const apiCache = new Map<string, ApiCache[]>();
 
-    // // The current epoch is still in progress — inflation rewards aren't available
-    // // until it completes (same as firedancerScripts/infor.ts).
-    // for (let targetEpoch = epoch - 1; targetEpoch >= epoch - PAST_EPOCH_LIMIT && targetEpoch >= 0; targetEpoch--) {
-    //     console.log("fetching epoch:", targetEpoch);
-    //     const { validators } = await fetchValidatorsForEpoch(targetEpoch);
+    const uniqueIdentities = [...new Set(rows.map((row) => row.identity_account))];
+    console.log(`Fetching epoch performance for ${uniqueIdentities.length} unique validators`);
 
-    //     for (const item of validators) {
-    //         valInfo.push({
-    //             name: "",
-    //             client: "",
-    //             identity_account: item.identity_account,
-    //             vote_account: item.vote_account,
-    //             mev_commission_bps: item.mev_commission_bps,
-    //             mev_rewards: item.mev_rewards,
-    //             priority_fee_commission_bps: item.priority_fee_commission_bps,
-    //             priority_fee_rewards: item.priority_fee_rewards,
-    //             avg_stake: toStakeBn(item.active_stake),
-    //             epoch: targetEpoch,
-    //             inflationRewards: 0,
-    //         });
-    //     }
+    let fetched = 0;
+    for (const identity of uniqueIdentities) {
+        if (apiCache.has(identity)) continue;
 
-    //     await fetchInflationRewardsForEpoch(targetEpoch);
-    //     await sleep(API_CALL_INTERVAL);
-    // }
+        const entries = await withRetry(
+            () => fetchEpochPerformance(identity),
+            `epoch-performance (${identity})`,
+        );
 
-    enrichValidatorNamesFromValStats();
+        for (const entry of entries) {
+            const key = entry.leader ?? identity;
+            const cached = apiCache.get(key) ?? [];
+            cached.push({
+                epoch: entry.epoch,
+                vote_fees: entry.vote_fees,
+                priority_fees: entry.priority_fees,
+                jito_total: entry.jito_total,
+            });
+            apiCache.set(key, cached);
+        }
+
+        // Mark identities with no data so they aren't re-fetched.
+        if (!apiCache.has(identity)) apiCache.set(identity, []);
+
+        fetched++;
+        console.log(`[${fetched}/${uniqueIdentities.length}] ${identity}: cached ${entries.length} epochs`);
+        await sleep(API_CALL_INTERVAL);
+    }
+
+    // Patch each CSV row from the cache entry with the matching epoch.
+    let updated = 0;
+    for (const row of rows) {
+        const cached = apiCache.get(row.identity_account);
+        if (!cached) continue;
+
+        const entry = cached.find((c) => c.epoch === row.epoch);
+        if (!entry) continue;
+
+        row.mev_rewards = entry.jito_total;
+        row.priority_fee_rewards = entry.priority_fees;
+        row.vote_fees = entry.vote_fees;
+        updated++;
+    }
+    console.log(`Updated ${updated}/${rows.length} rows from the API cache`);
+
+    writeValStats2(rows);
 };
