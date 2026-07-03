@@ -92,7 +92,7 @@ def prepare_table_data(df: pd.DataFrame, sol_usd: float) -> pd.DataFrame:
     table = df.copy()
     table["epoch_earning_sol"] = table["epoch_earning"] / LAMPORTS_PER_SOL
     table["earning_usd"] = table["epoch_earning_sol"] * sol_usd
-    return table
+    return table.drop(columns=["epoch_earning"])
 
 
 def aggregate_epoch_range(df: pd.DataFrame, epoch_start: int, epoch_end: int) -> pd.DataFrame:
