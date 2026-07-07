@@ -2,13 +2,9 @@
 
 Reads ../report/val_stats3.csv (one row per validator per epoch) and shows:
   1. Stake vs. Earning       (scatter, per validator over the selected range)
-  2. Client vs. Earning      (aggregated bar)
-  3. Accumulated table       (one row per validator identity; sums for all
-                              monetary columns, average for stake_in_epoch)
-
-Per-epoch earning comes straight from the SVT API validation:
-    total_sol = leader + commission + jito - voting fee + voting compensation
-    total_usd = total_sol * per-epoch SOL price
+  2. Client vs. Earnings      (aggregated bar)
+  3. Earnings vs. Dates       (time series over epoch date ranges)
+  4. Accumulated table        (one row per validator identity)
 
 Run with:
     streamlit run frontend/app.py
@@ -22,10 +18,9 @@ import streamlit as st
 
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "report" / "val_stats3.csv"
 
-# Per-epoch columns that are summed when accumulating per validator.
 SUM_COLS = [
     "leader_reward_sol",
-    "commission_sol",
+    "inflation_rewards_sol",
     "jito_reward_sol",
     "voting_fee_sol",
     "voting_compensation_sol",
@@ -38,7 +33,7 @@ SUM_COLS = [
 def load_data(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
-    numeric_cols = SUM_COLS + ["epoch", "sol_price", "stake_in_epoch"]
+    numeric_cols = SUM_COLS + ["epoch", "sol_price", "stake_in_epoch", "commission"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
@@ -48,19 +43,23 @@ def load_data(csv_path: Path) -> pd.DataFrame:
         lambda r: r["name"] if str(r["name"]).strip() else r["identity_account"],
         axis=1,
     )
+    df["period_start"] = df["dates"].map(parse_period_start)
     return df
 
 
 @st.cache_data
 def epoch_dates_map(df: pd.DataFrame) -> dict[int, str]:
-    """epoch -> date range string, e.g. 981 -> '02.06.2026 - 04.06.2026'."""
     pairs = df[["epoch", "dates"]].dropna().drop_duplicates("epoch")
     return dict(zip(pairs["epoch"].astype(int), pairs["dates"].astype(str)))
 
 
-def aggregate_per_identity(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per identity: sums for monetary columns, average stake."""
+def parse_period_start(dates: str) -> pd.Timestamp:
+    """First day of an epoch date range, e.g. '02.06.2026 - 04.06.2026'."""
+    start_str = str(dates).split(" - ")[0].strip()
+    return pd.to_datetime(start_str, format="%d.%m.%Y")
 
+
+def aggregate_per_identity(df: pd.DataFrame) -> pd.DataFrame:
     def first_non_empty(series: pd.Series) -> str:
         for value in series:
             if str(value).strip():
@@ -74,12 +73,13 @@ def aggregate_per_identity(df: pd.DataFrame) -> pd.DataFrame:
             client=("client", first_non_empty),
             vote_account=("vote_account", "first"),
             leader_reward_sol=("leader_reward_sol", "sum"),
-            commission_sol=("commission_sol", "sum"),
+            inflation_rewards_sol=("inflation_rewards_sol", "sum"),
             jito_reward_sol=("jito_reward_sol", "sum"),
             voting_fee_sol=("voting_fee_sol", "sum"),
             voting_compensation_sol=("voting_compensation_sol", "sum"),
             total_sol=("total_sol", "sum"),
             total_usd=("total_usd", "sum"),
+            commission=("commission", "max"),
             avg_stake_in_epoch=("stake_in_epoch", "mean"),
             epochs=("epoch", "nunique"),
         )
@@ -91,10 +91,19 @@ def aggregate_per_identity(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def aggregate_earnings_by_date(epoch_df: pd.DataFrame, earning_col: str) -> pd.DataFrame:
+    """Sum earnings per epoch date range across filtered validators."""
+    return (
+        epoch_df.groupby(["epoch", "dates", "period_start"], as_index=False)[earning_col]
+        .sum()
+        .rename(columns={earning_col: "earning"})
+        .sort_values("period_start")
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Validator Earnings", page_icon="📊", layout="wide")
 
-    # ---- Sidebar: data source & display options ----------------------------
     with st.sidebar:
         st.header("Data & display")
         csv_path = Path(st.text_input("CSV path", value=str(DEFAULT_CSV_PATH)))
@@ -117,12 +126,10 @@ def main() -> None:
 
     st.title("Solana Validator Earnings")
     st.caption(
-        "Per-epoch earning = leader + commission + jito − voting fee + voting "
-        "compensation (from val_stats3). Stake shown is the average "
-        "stake_in_epoch over the selected range."
+        "Per-epoch earning = leader + inflation + jito − voting fee + voting "
+        "compensation (from val_stats3)."
     )
 
-    # ---- Epoch / date range -------------------------------------------------
     dates_by_epoch = epoch_dates_map(raw)
     epochs = sorted(dates_by_epoch)
 
@@ -140,12 +147,11 @@ def main() -> None:
 
     in_range = raw[(raw["epoch"] >= epoch_start) & (raw["epoch"] <= epoch_end)]
     if in_range.empty:
-        st.warning("No data in the selected epoch range.")
+        st.warning("No data in the selected date range.")
         st.stop()
 
     aggregated = aggregate_per_identity(in_range)
 
-    # ---- Filters ------------------------------------------------------------
     st.subheader("Filters")
 
     fcol1, fcol2 = st.columns(2)
@@ -192,15 +198,14 @@ def main() -> None:
         st.stop()
 
     df["earning"] = df[earning_col]
+    filtered_epochs = in_range[in_range["identity_account"].isin(df["identity_account"])]
 
-    # ---- Insight metrics ----------------------------------------------------
+    # ---- Insights -----------------------------------------------------------
     st.subheader("Insights")
 
     client_totals = df.groupby("client")["earning"].sum()
     top_client = client_totals.idxmax()
     top_validator = df.loc[df["earning"].idxmax()]
-    # Earnings yield: how much a validator earns per SOL staked, annualized nothing —
-    # just the raw ratio over the range, useful to compare big vs small stakes.
     total_stake = df["avg_stake_in_epoch"].sum()
     earning_per_msol = df["earning"].sum() / total_stake * 1_000_000 if total_stake else 0
     stake_earning_corr = df["avg_stake_in_epoch"].corr(df["earning"])
@@ -227,7 +232,7 @@ def main() -> None:
     m7.metric(f"Earnings per 1M SOL staked ({unit_suffix})", f"{earning_per_msol:,.2f}")
     m8.metric("Stake ↔ earning correlation", f"{stake_earning_corr:.3f}")
 
-    # ---- Graph 1: stake vs earning -------------------------------------------
+    # ---- Graph 1: stake vs earning ------------------------------------------
     st.subheader("Stake vs. Earning")
     scatter = px.scatter(
         df,
@@ -251,9 +256,10 @@ def main() -> None:
         height=600,
     )
     scatter.update_traces(marker=dict(size=8, opacity=0.7))
+    st.caption("One point per validator over the full selected date range.")
     st.plotly_chart(scatter, use_container_width=True)
 
-    # ---- Graph 2: client vs earnings -----------------------------------------
+    # ---- Graph 2: client vs earnings ----------------------------------------
     st.subheader("Client vs. Earnings")
     per_client = (
         df.groupby("client")["earning"]
@@ -279,6 +285,27 @@ def main() -> None:
     bar.update_layout(showlegend=False, xaxis={"categoryorder": "total descending"})
     st.plotly_chart(bar, use_container_width=True)
 
+    # ---- Graph 3: earnings vs dates -----------------------------------------
+    st.subheader("Earnings vs. Dates")
+    by_date = aggregate_earnings_by_date(filtered_epochs, earning_col)
+
+    timeline = px.line(
+        by_date,
+        x="dates",
+        y="earning",
+        markers=True,
+        labels={
+            "dates": "Date",
+            "earning": f"Total earnings ({unit_suffix})",
+        },
+        height=450,
+    )
+    timeline.update_layout(xaxis={"categoryorder": "array", "categoryarray": by_date["dates"].tolist()})
+    st.caption(
+        f"Total earnings across {len(df):,} filtered validators, summed per epoch date range."
+    )
+    st.plotly_chart(timeline, use_container_width=True)
+
     # ---- Accumulated table ----------------------------------------------------
     st.subheader("Accumulated per validator")
     table = df[
@@ -289,7 +316,8 @@ def main() -> None:
             "avg_stake_in_epoch",
             "epochs",
             "leader_reward_sol",
-            "commission_sol",
+            "inflation_rewards_sol",
+            "commission",
             "jito_reward_sol",
             "voting_fee_sol",
             "voting_compensation_sol",
@@ -300,9 +328,8 @@ def main() -> None:
 
     st.caption(
         f"{len(table):,} validators · {dates_by_epoch[epoch_start]} → "
-        f"{dates_by_epoch[epoch_end]} · "
-        "monetary columns are accumulated sums; avg_stake_in_epoch is the "
-        "average across the validator's epochs in range."
+        f"{dates_by_epoch[epoch_end]} · monetary columns are accumulated sums; "
+        "avg_stake_in_epoch is the average across epochs in range."
     )
     st.dataframe(table, use_container_width=True, hide_index=True)
 
